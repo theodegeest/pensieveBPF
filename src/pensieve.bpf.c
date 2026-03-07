@@ -10,15 +10,12 @@
 
 char LICENSE[] SEC("license") = "Dual BSD/GPL";
 
-const volatile unsigned long long granularity_ns = 1e9;
-
-typedef enum thread_state {
-  SCHEDULED_OUT = 0,
-  SCHEDUDED_IN = 1,
-} thread_state_t;
+// const volatile unsigned long long granularity_ns = 1e9;
+const volatile unsigned long long granularity_ns = 1e6;
 
 struct internal_thread_info {
   u64 thread_creation_ts;
+  u64 block_index;
   u64 block_start_ts;
   thread_state_t state;
 };
@@ -51,100 +48,107 @@ struct {
 
 const volatile unsigned long long min_duration_ns = 0;
 
-SEC("tp/sched/sched_process_exec")
-int handle_exec(struct trace_event_raw_sched_process_exec *ctx) {
-  struct task_struct *task;
-  unsigned fname_off;
-  struct event *e;
-  pid_t pid;
-  u64 ts;
+// SEC("tp/sched/sched_process_exec")
+// int handle_exec(struct trace_event_raw_sched_process_exec *ctx) {
+//   struct task_struct *task;
+//   unsigned fname_off;
+//   struct event *e;
+//   pid_t pid;
+//   u64 ts;
 
-  /* remember time exec() was executed for this PID */
-  pid = bpf_get_current_pid_tgid() >> 32;
-  ts = bpf_ktime_get_ns();
-  bpf_map_update_elem(&exec_start, &pid, &ts, BPF_ANY);
+//   /* remember time exec() was executed for this PID */
+//   pid = bpf_get_current_pid_tgid() >> 32;
+//   ts = bpf_ktime_get_ns();
+//   bpf_map_update_elem(&exec_start, &pid, &ts, BPF_ANY);
 
-  /* don't emit exec events when minimum duration is specified */
-  if (min_duration_ns)
-    return 0;
+//   /* don't emit exec events when minimum duration is specified */
+//   if (min_duration_ns)
+//     return 0;
 
-  /* reserve sample from BPF ringbuf */
-  e = bpf_ringbuf_reserve(&rb, sizeof(*e), 0);
-  if (!e)
-    return 0;
+//   /* reserve sample from BPF ringbuf */
+//   e = bpf_ringbuf_reserve(&rb, sizeof(*e), 0);
+//   if (!e)
+//     return 0;
 
-  /* fill out the sample with data */
-  task = (struct task_struct *)bpf_get_current_task();
+//   /* fill out the sample with data */
+//   task = (struct task_struct *)bpf_get_current_task();
 
-  e->exit_event = false;
-  e->pid = pid;
-  e->ppid = BPF_CORE_READ(task, real_parent, tgid);
-  bpf_get_current_comm(&e->comm, sizeof(e->comm));
+//   e->exit_event = false;
+//   e->pid = pid;
+//   e->ppid = BPF_CORE_READ(task, real_parent, tgid);
+//   bpf_get_current_comm(&e->comm, sizeof(e->comm));
 
-  fname_off = ctx->__data_loc_filename & 0xFFFF;
-  bpf_probe_read_str(&e->filename, sizeof(e->filename),
-                     (void *)ctx + fname_off);
+//   fname_off = ctx->__data_loc_filename & 0xFFFF;
+//   bpf_probe_read_str(&e->filename, sizeof(e->filename),
+//                      (void *)ctx + fname_off);
 
-  /* successfully submit it to user-space for post-processing */
-  bpf_ringbuf_submit(e, 0);
-  return 0;
-}
+//   /* successfully submit it to user-space for post-processing */
+//   bpf_ringbuf_submit(e, 0);
+//   return 0;
+// }
 
-SEC("tp/sched/sched_process_exit")
-int handle_exit(struct trace_event_raw_sched_process_template *ctx) {
-  struct task_struct *task;
-  struct event *e;
-  pid_t pid, tid;
-  u64 id, ts, *start_ts, duration_ns = 0;
+// SEC("tp/sched/sched_process_exit")
+// int handle_exit(struct trace_event_raw_sched_process_template *ctx) {
+//   struct task_struct *task;
+//   struct event *e;
+//   pid_t pid, tid;
+//   u64 id, ts, *start_ts, duration_ns = 0;
 
-  /* get PID and TID of exiting thread/process */
-  id = bpf_get_current_pid_tgid();
-  pid = id >> 32;
-  tid = (u32)id;
+//   /* get PID and TID of exiting thread/process */
+//   id = bpf_get_current_pid_tgid();
+//   pid = id >> 32;
+//   tid = (u32)id;
 
-  /* ignore thread exits */
-  if (pid != tid)
-    return 0;
+//   /* ignore thread exits */
+//   if (pid != tid)
+//     return 0;
 
-  /* if we recorded start of the process, calculate lifetime duration */
-  start_ts = bpf_map_lookup_elem(&exec_start, &pid);
-  if (start_ts)
-    duration_ns = bpf_ktime_get_ns() - *start_ts;
-  else if (min_duration_ns)
-    return 0;
-  bpf_map_delete_elem(&exec_start, &pid);
+//   /* if we recorded start of the process, calculate lifetime duration */
+//   start_ts = bpf_map_lookup_elem(&exec_start, &pid);
+//   if (start_ts)
+//     duration_ns = bpf_ktime_get_ns() - *start_ts;
+//   else if (min_duration_ns)
+//     return 0;
+//   bpf_map_delete_elem(&exec_start, &pid);
 
-  /* if process didn't live long enough, return early */
-  if (min_duration_ns && duration_ns < min_duration_ns)
-    return 0;
+//   /* if process didn't live long enough, return early */
+//   if (min_duration_ns && duration_ns < min_duration_ns)
+//     return 0;
 
-  /* reserve sample from BPF ringbuf */
-  e = bpf_ringbuf_reserve(&rb, sizeof(*e), 0);
-  if (!e)
-    return 0;
+//   /* reserve sample from BPF ringbuf */
+//   e = bpf_ringbuf_reserve(&rb, sizeof(*e), 0);
+//   if (!e)
+//     return 0;
 
-  /* fill out the sample with data */
-  task = (struct task_struct *)bpf_get_current_task();
+//   /* fill out the sample with data */
+//   task = (struct task_struct *)bpf_get_current_task();
 
-  e->exit_event = true;
-  e->duration_ns = duration_ns;
-  e->pid = pid;
-  e->ppid = BPF_CORE_READ(task, real_parent, tgid);
-  e->exit_code = (BPF_CORE_READ(task, exit_code) >> 8) & 0xff;
-  bpf_get_current_comm(&e->comm, sizeof(e->comm));
+//   e->exit_event = true;
+//   e->duration_ns = duration_ns;
+//   e->pid = pid;
+//   e->ppid = BPF_CORE_READ(task, real_parent, tgid);
+//   e->exit_code = (BPF_CORE_READ(task, exit_code) >> 8) & 0xff;
+//   bpf_get_current_comm(&e->comm, sizeof(e->comm));
 
-  /* send data to user-space for post-processing */
-  bpf_ringbuf_submit(e, 0);
-  return 0;
+//   /* send data to user-space for post-processing */
+//   bpf_ringbuf_submit(e, 0);
+//   return 0;
+// }
+
+static s64 get_block_index(u64 current_time, u64 start_time) {
+  if (current_time < start_time) {
+    bpf_printk("get_block_index [%d] current is before start time\n");
+    return -1;
+  }
+  return (current_time - start_time) / granularity_ns;
 }
 
 static s64 start_of_block(u64 current_time, u64 start_time) {
   if (current_time < start_time) {
-    bpf_printk("start_of_blockbpf_get_current_comm(&e->comm, sizeof(e->comm)); "
-               "[%d] current is before start time\n");
+    bpf_printk("start_of_block [%d] current is before start time\n");
     return -1;
   }
-  long n = floor((current_time - start_time) / granularity_ns);
+  s64 n = (current_time - start_time) / granularity_ns;
   return start_time + n * granularity_ns;
 }
 
@@ -234,6 +238,7 @@ int trace_fork(struct trace_event_raw_sched_process_fork *ctx) {
   }
 
   info.thread_creation_ts = bpf_ktime_get_ns();
+  info.block_index = 0;
   info.block_start_ts = info.block_start_ts;
   info.state = SCHEDULED_OUT;
 
@@ -252,7 +257,12 @@ int trace_exit(struct trace_event_raw_sched_process_template *ctx) {
   pid_t pid;
   s64 delta;
   struct internal_thread_info *info_p;
+  struct profile_block *profile_block_p;
   char comm[TASK_COMM_LEN] = {};
+  u64 current_time_ts;
+
+  current_time_ts = bpf_ktime_get_ns();
+
   bpf_get_current_comm(&comm, sizeof(comm));
 
   pid = bpf_get_current_pid_tgid() >> 32;
@@ -264,8 +274,33 @@ int trace_exit(struct trace_event_raw_sched_process_template *ctx) {
     return 0;
   }
 
-  delta = (s64)(bpf_ktime_get_ns() - info_p->thread_creation_ts);
-  bpf_printk("exit (%d) FOUND in map, delta %lld ns\n", pid, delta);
+  if (info_p->state == SCHEDULED_OUT) {
+    // The thread was killed while it was scheduled out
+    // This means that we must get to know how long it was waiting
+    // This will make it possible to find the load imbalance.
+
+  }
+
+  delta = (s64)(current_time_ts - info_p->thread_creation_ts);
+
+  s64 n = (current_time_ts - info_p->thread_creation_ts) / granularity_ns;
+  bpf_printk("exit (%d) FOUND in map, start = %lld, delta %lld ns, n = %ld, "
+             "block_start_ts = %lld\n",
+             pid, info_p->thread_creation_ts, delta, n,
+             start_of_block(current_time_ts, info_p->thread_creation_ts));
+
+  /* reserve sample from BPF ringbuf */
+  profile_block_p = bpf_ringbuf_reserve(&rb, sizeof(*profile_block_p), 0);
+  if (!profile_block_p)
+    return 0;
+
+  profile_block_p->pid = pid;
+  profile_block_p->start_time_ns = start_of_block(current_time_ts, info_p->thread_creation_ts);
+  profile_block_p->offcpu_component = 0;
+  profile_block_p->end_state = info_p->state;
+
+  /* send data to user-space for post-processing */
+  bpf_ringbuf_submit(profile_block_p, 0);
 
   goto cleanup;
 

@@ -72,25 +72,31 @@ static volatile bool exiting = false;
 static void sig_handler(int sig) { exiting = true; }
 
 static int handle_event(void *ctx, void *data, size_t data_sz) {
-  const struct event *e = data;
-  struct tm *tm;
-  char ts[32];
-  time_t t;
+  const struct profile_block *profile_block_p = data;
+  // struct tm *tm;
+  // char ts[32];
+  // time_t t;
 
-  time(&t);
-  tm = localtime(&t);
-  strftime(ts, sizeof(ts), "%H:%M:%S", tm);
+  // time(&t);
+  // tm = localtime(&t);
+  // strftime(ts, sizeof(ts), "%H:%M:%S", tm);
 
-  if (e->exit_event) {
-    printf("%-8s %-5s %-16s %-7d %-7d [%u]", ts, "EXIT", e->comm, e->pid,
-           e->ppid, e->exit_code);
-    if (e->duration_ns)
-      printf(" (%llums)", e->duration_ns / 1000000);
-    printf("\n");
-  } else {
-    printf("%-8s %-5s %-16s %-7d %-7d %s\n", ts, "EXEC", e->comm, e->pid,
-           e->ppid, e->filename);
-  }
+  // if (e->exit_event) {
+  //   printf("%-8s %-5s %-16s %-7d %-7d [%u]", ts, "EXIT", e->comm, e->pid,
+  //          e->ppid, e->exit_code);
+  //   if (e->duration_ns)
+  //     printf(" (%llums)", e->duration_ns / 1000000);
+  //   printf("\n");
+  // } else {
+  //   printf("%-8s %-5s %-16s %-7d %-7d %s\n", ts, "EXEC", e->comm, e->pid,
+  //          e->ppid, e->filename);
+  // }
+
+  printf(
+      "profile_block: (%d), start_time = %llu, offcpu = %d, end_state = %s\n",
+      profile_block_p->pid, profile_block_p->start_time_ns,
+      profile_block_p->offcpu_component,
+      thread_state_name[profile_block_p->end_state]);
 
   return 0;
 }

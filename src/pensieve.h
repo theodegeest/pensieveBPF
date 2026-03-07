@@ -16,10 +16,18 @@ struct event {
   bool exit_event;
 };
 
+typedef enum thread_state {
+  SCHEDULED_OUT = 0,
+  SCHEDUDED_IN = 1,
+} thread_state_t;
+
+const char *thread_state_name[] = {"SCHEDULED_OUT", "SCHEDUDED_IN"};
+
 struct profile_block {
-  int tid;
+  int pid;
   unsigned long long start_time_ns;
   int offcpu_component;
+  thread_state_t end_state;
 };
 
 #endif /* __PENSIEVE_H */
