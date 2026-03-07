@@ -140,7 +140,8 @@ int handle_exit(struct trace_event_raw_sched_process_template *ctx) {
 
 static s64 start_of_block(u64 current_time, u64 start_time) {
   if (current_time < start_time) {
-    bpf_printk("start_of_block [%d] current is before start time\n");
+    bpf_printk("start_of_blockbpf_get_current_comm(&e->comm, sizeof(e->comm)); "
+               "[%d] current is before start time\n");
     return -1;
   }
   long n = floor((current_time - start_time) / granularity_ns);
@@ -180,9 +181,9 @@ static int handle_sched_switch(void *ctx, bool preempt,
 
   scheduled_out_ts_p = bpf_map_lookup_elem(&scheduled_out_start, &pid);
   if (!scheduled_out_ts_p) {
-    bpf_printk("handle_sched_switch [%d] pid (%d, %d) not found in "
-               "scheduled_out_start\n",
-               bpf_get_smp_processor_id(), pid, tgid);
+    // bpf_printk("handle_sched_switch [%d] pid (%d, %d) not found in "
+    //            "scheduled_out_start\n",
+    //            bpf_get_smp_processor_id(), pid, tgid);
     return 0;
   }
   delta = (s64)(bpf_ktime_get_ns() - *scheduled_out_ts_p);
@@ -219,7 +220,27 @@ int BPF_PROG(sched_switch, bool preempt, struct task_struct *prev,
 // Thread creation
 SEC("tracepoint/sched/sched_process_fork")
 int trace_fork(struct trace_event_raw_sched_process_fork *ctx) {
+  pid_t pid;
+  struct internal_thread_info *info_p, info = {};
+
   bpf_printk("fork parent=%d child=%d\n", ctx->parent_pid, ctx->child_pid);
+
+  pid = ctx->child_pid;
+
+  info_p = bpf_map_lookup_elem(&thread_map, &pid);
+  if (info_p) {
+    bpf_printk("fork (%d) already in map\n", pid);
+    return 0;
+  }
+
+  info.thread_creation_ts = bpf_ktime_get_ns();
+  info.block_start_ts = info.block_start_ts;
+  info.state = SCHEDULED_OUT;
+
+  long ret = bpf_map_update_elem(&thread_map, &pid, &info, BPF_ANY);
+  if (ret) {
+    bpf_printk("fork (%d) failed to update element\n", pid);
+  }
 
   return 0;
 }
@@ -228,9 +249,27 @@ int trace_fork(struct trace_event_raw_sched_process_fork *ctx) {
 // Thread destruction
 SEC("tracepoint/sched/sched_process_exit")
 int trace_exit(struct trace_event_raw_sched_process_template *ctx) {
+  pid_t pid;
+  s64 delta;
+  struct internal_thread_info *info_p;
   char comm[TASK_COMM_LEN] = {};
   bpf_get_current_comm(&comm, sizeof(comm));
-  // ctx->pid = thread id
-  bpf_printk("exit: tid=%d, comm = %s \n", ctx->pid, comm);
+
+  pid = bpf_get_current_pid_tgid() >> 32;
+  bpf_printk("exit: pid=%d, comm = %s \n", pid, comm);
+
+  info_p = bpf_map_lookup_elem(&thread_map, &pid);
+  if (!info_p) {
+    bpf_printk("exit (%d) not found in map\n", pid);
+    return 0;
+  }
+
+  delta = (s64)(bpf_ktime_get_ns() - info_p->thread_creation_ts);
+  bpf_printk("exit (%d) FOUND in map, delta %lld ns\n", pid, delta);
+
+  goto cleanup;
+
+cleanup:
+  bpf_map_delete_elem(&thread_map, &pid);
   return 0;
 }
