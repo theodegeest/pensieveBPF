@@ -344,3 +344,31 @@ cleanup:
   bpf_map_delete_elem(&thread_map, &pid);
   return 0;
 }
+
+// Userspace mutex lock call
+SEC("uprobe/libc.so.6:__pthread_mutex_lock")
+int BPF_PROG(uprobe_pthread_mutex_lock, void *unused) {
+  u64 id = bpf_get_current_pid_tgid();
+  u32 pid = (u32)id;   // thread id (tid)
+  u32 tgid = id >> 32; // process id (tgid)
+
+  if (!allowed_pid_tgid(pid, tgid))
+    return 0;
+
+  bpf_printk("UPROBE: pthread_mutex_lock tgid=%u pid=%u\n", tgid, pid);
+  return 0;
+}
+
+// Userspace mutex call
+// SEC("uprobe/libc.so.6:__pthread_mutex_unlock")
+// int BPF_PROG(uprobe_pthread_mutex_unlock, void *unused) {
+//   u64 id = bpf_get_current_pid_tgid();
+//   u32 pid = (u32)id;
+//   u32 tgid = id >> 32;
+
+//   if (!allowed_pid_tgid(pid, tgid))
+//     return 0;
+
+//   bpf_printk("UPROBE: pthread_mutex_unlock tgid=%u pid=%u\n", tgid, pid);
+//   return 0;
+// }
