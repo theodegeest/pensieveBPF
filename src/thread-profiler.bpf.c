@@ -349,8 +349,8 @@ cleanup:
 SEC("uprobe/libc.so.6:__pthread_mutex_lock")
 int BPF_PROG(uprobe_pthread_mutex_lock, void *unused) {
   u64 id = bpf_get_current_pid_tgid();
-  u32 pid = (u32)id;   // thread id (tid)
-  u32 tgid = id >> 32; // process id (tgid)
+  u32 pid = (u32)id;
+  u32 tgid = id >> 32;
 
   if (!allowed_pid_tgid(pid, tgid))
     return 0;
@@ -359,19 +359,19 @@ int BPF_PROG(uprobe_pthread_mutex_lock, void *unused) {
   return 0;
 }
 
-// Userspace mutex call
-// SEC("uprobe/libc.so.6:__pthread_mutex_unlock")
-// int BPF_PROG(uprobe_pthread_mutex_unlock, void *unused) {
-//   u64 id = bpf_get_current_pid_tgid();
-//   u32 pid = (u32)id;
-//   u32 tgid = id >> 32;
+// Userspace mutex lock return
+SEC("uretprobe/libc.so.6:__pthread_mutex_lock")
+int BPF_PROG(uretprobe_pthread_mutex_lock, void *unused) {
+  u64 id = bpf_get_current_pid_tgid();
+  u32 pid = (u32)id;
+  u32 tgid = id >> 32;
 
-//   if (!allowed_pid_tgid(pid, tgid))
-//     return 0;
+  if (!allowed_pid_tgid(pid, tgid))
+    return 0;
 
-//   bpf_printk("UPROBE: pthread_mutex_unlock tgid=%u pid=%u\n", tgid, pid);
-//   return 0;
-// }
+  // bpf_printk("URETPROBE: pthread_mutex_lock tgid=%u pid=%u\n", tgid, pid);
+  return 0;
+}
 
 // Userspace barrier wait call
 SEC("uprobe/libc.so.6:pthread_barrier_wait")
@@ -384,6 +384,20 @@ int BPF_PROG(uprobe_pthread_barrier_wait, void *unused) {
     return 0;
 
   bpf_printk("UPROBE: pthread_barrier_wait tgid=%u pid=%u\n", tgid, pid);
+  return 0;
+}
+
+// Userspace barrier wait return
+SEC("uretprobe/libc.so.6:pthread_barrier_wait")
+int BPF_PROG(uretprobe_pthread_barrier_wait, void *unused) {
+  u64 id = bpf_get_current_pid_tgid();
+  u32 pid = (u32)id;   // thread id (tid)
+  u32 tgid = id >> 32; // process id (tgid)
+
+  if (!allowed_pid_tgid(pid, tgid))
+    return 0;
+
+  bpf_printk("URETPROBE: pthread_barrier_wait tgid=%u pid=%u\n", tgid, pid);
   return 0;
 }
 
@@ -412,5 +426,19 @@ int BPF_PROG(uprobe_sem_wait, void *unused) {
     return 0;
 
   bpf_printk("UPROBE: sem_wait tgid=%u pid=%u\n", tgid, pid);
+  return 0;
+}
+
+// Userspace semaphore wait return
+SEC("uretprobe/libc.so.6:sem_wait")
+int BPF_PROG(uretprobe_sem_wait, void *unused) {
+  u64 id = bpf_get_current_pid_tgid();
+  u32 pid = (u32)id;   // thread id (tid)
+  u32 tgid = id >> 32; // process id (tgid)
+
+  if (!allowed_pid_tgid(pid, tgid))
+    return 0;
+
+  bpf_printk("URETPROBE: sem_wait tgid=%u pid=%u\n", tgid, pid);
   return 0;
 }
