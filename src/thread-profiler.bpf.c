@@ -446,8 +446,10 @@ int trace_exit(struct trace_event_raw_sched_process_template *ctx) {
   bpf_get_current_comm(&comm, sizeof(comm));
 
   pid_tgid = bpf_get_current_pid_tgid();
-  pid = pid_tgid >> 32;
-  tgid = (u32)pid_tgid;
+  // pid = pid_tgid >> 32;
+  // tgid = (u32)pid_tgid;
+  pid = (u32)pid_tgid;
+  tgid = pid_tgid >> 32;
 
   if (!allowed_pid_tgid(pid, tgid)) {
     return 0;

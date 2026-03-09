@@ -139,7 +139,7 @@ static int handle_event(void *ctx, void *data, size_t data_sz) {
   return 0;
 }
 
-uint64_t get_ns() {
+uint64_t get_current_time_ns() {
   struct timespec ts;
   clock_gettime(CLOCK_MONOTONIC, &ts);
   return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
@@ -254,7 +254,7 @@ int main(int argc, char **argv) {
         printf("%d %llu %llu %llu %llu %llu %s %lu\n", key, value.block_index,
                value.block_start_ts, value.first_block_event_ts,
                value.last_event_ts, value.offcpu_time_ns,
-               thread_state_name[value.state], get_ns());
+               thread_state_name[value.state], get_current_time_ns());
       }
 
       if (bpf_map_get_next_key(map_fd, &key, &next_key) != 0)
