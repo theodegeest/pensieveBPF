@@ -71,6 +71,7 @@ static int create_new_thread_info(struct internal_thread_info *info_p,
   info_p->last_event_ts = current_time;
   info_p->offcpu_time_ns = 0;
   info_p->mutex_wait_time_ns = 0;
+  info_p->futex_time_ns = 0;
   info_p->disk_io_time_ns = 0;
   info_p->state = initial_state;
 
@@ -93,6 +94,7 @@ static int submit_current_block(pid_t pid,
   profile_block_p->last_event_time_ns = info_p->last_event_ts;
   profile_block_p->offcpu_time_ns = info_p->offcpu_time_ns;
   profile_block_p->mutex_wait_time_ns = info_p->mutex_wait_time_ns;
+  profile_block_p->futex_time_ns = info_p->futex_time_ns;
   profile_block_p->disk_io_time_ns = info_p->disk_io_time_ns;
   profile_block_p->end_state = info_p->state;
 
@@ -110,6 +112,7 @@ static int bump_block(struct internal_thread_info *info_p,
   info_p->last_event_ts = current_time_ts;
   info_p->offcpu_time_ns = 0;
   info_p->mutex_wait_time_ns = 0;
+  info_p->futex_time_ns = 0;
   info_p->disk_io_time_ns = 0;
   return 0;
 }
@@ -157,6 +160,8 @@ static int handle_sched_switch(void *ctx, bool preempt,
       // still a mutex wait.
       goto skip_prev;
     } else if (info_p->state == DISK_IO) {
+      goto skip_prev;
+    } else if (info_p->state == FUTEX) {
       goto skip_prev;
     }
 
@@ -209,6 +214,8 @@ skip_prev:
     // lock is still not acquired.
     goto cleanup;
   } else if (info_p->state == DISK_IO) {
+    goto cleanup;
+  } else if (info_p->state == FUTEX) {
     goto cleanup;
   }
 
@@ -364,6 +371,23 @@ cleanup:
   return 0;
 }
 
+// TODO: The idea here will be that we want to 1 be able to mark a thread saying
+// I have started this type of event, for example a mutex lock. Then, when
+// another event triggers, it looks at the mark. If the mark tells it that it
+// was doing a mutex, then it can calculate how long that mutex took for at
+// least a partial result for that mutex. Then, it can continue on the
+// computation by marking itself to the current event, which can be a futex, for
+// example. When this event ends, it can calculate the futex length.
+// To encode this stack-like behavior, we could make a mark, for example, futex.
+// Then, another one, futex-in-mutex. So That we can differentiate between a
+// futex call that we cannot classify yet, and a futex call inside a mutex.
+//
+// So maybe we need to change the API so that we have a marking step and an
+// actual computation for the delta from what was already marked. I am unsure if
+// this can be a single function or that it needs to be split up in two.
+// One way to do this is with a single function and if it is SCHEDULED_IN we
+// don't do anything with the previous delta.
+
 static int enter_event(pid_t pid, thread_state_t new_block_state,
                        thread_state_t new_state) {
   struct internal_thread_info *info_p, info = {};
@@ -372,17 +396,15 @@ static int enter_event(pid_t pid, thread_state_t new_block_state,
 
   current_time = bpf_ktime_get_ns();
 
-  // bpf_printk("UPROBE: pthread_mutex_lock tgid=%u pid=%u\n", tgid, pid);
-
   info_p = bpf_map_lookup_elem(&thread_map, &pid);
   if (!info_p) {
     // There was no thread info, create new
-    bpf_printk("uprobe pthread_mutex_lock: no prev thread info (%d)\n", pid);
+    bpf_printk("enter_event: no prev thread info (%d)\n", pid);
     create_new_thread_info(&info, pid, new_block_state, current_time);
 
     info_p = bpf_map_lookup_elem(&thread_map, &pid);
     if (!info_p) {
-      bpf_printk("uprobe pthread_mutex_lock: Could not create thread info for "
+      bpf_printk("enter_event: Could not create thread info for "
                  "prev (%d)\n",
                  pid);
       return 0;
@@ -417,10 +439,6 @@ static int exit_event(pid_t pid, size_t field_offset,
 
   current_time = bpf_ktime_get_ns();
 
-  // unsigned long long *offset =
-  //     &(((struct internal_thread_info *)NULL)->mutex_wait_time_ns);
-
-  // bpf_printk("URETPROBE: pthread_mutex_lock tgid=%u pid=%u\n", tgid, pid);
   info_p = bpf_map_lookup_elem(&thread_map, &pid);
   if (!info_p) {
     // This thread was not yet encountered
@@ -451,12 +469,10 @@ static int exit_event(pid_t pid, size_t field_offset,
                  pid);
     }
 
-    // info_p->mutex_wait_time_ns += delta;
-    // *((char *)info_p + (int)offset) += delta;
     field_ptr = (u64 *)((char *)info_p + field_offset);
     *field_ptr += delta;
     info_p->last_event_ts = info_p->block_start_ts + granularity_ns;
-    info_p->state = new_state;
+    info_p->state = new_block_state;
     submit_current_block(pid, info_p);
     bump_block(info_p, current_block_index, current_time);
   }
@@ -477,8 +493,7 @@ static int exit_event(pid_t pid, size_t field_offset,
 
   field_ptr = (u64 *)((char *)info_p + field_offset);
   *field_ptr += delta;
-  // info_p->mutex_wait_time_ns += delta;
-  info_p->state = SCHEDULED_IN;
+  info_p->state = new_state;
 
 cleanup:
   return 0;
@@ -511,6 +526,33 @@ int BPF_PROG(uretprobe_pthread_mutex_lock, void *unused) {
   return exit_event(pid, offset, MUTEX_WAIT, SCHEDULED_IN);
 }
 
+// This is only the read system call
+SEC("tracepoint/syscalls/sys_enter_futex")
+int trace_enter_futex(struct trace_event_raw_sys_enter *ctx) {
+  u64 id = bpf_get_current_pid_tgid();
+  u32 tgid = id >> 32;
+  if (!allowed_tgid(tgid))
+    return 0;
+
+  u32 pid = (u32)id;
+
+  bpf_printk("tracepoint: sys_enter_futex tgid=%u pid=%u\n", tgid, pid);
+  return 0;
+}
+
+SEC("tracepoint/syscalls/sys_exit_futex")
+int trace_exit_futex(struct trace_event_raw_sys_exit *ctx) {
+  u64 id = bpf_get_current_pid_tgid();
+  u32 tgid = id >> 32;
+  if (!allowed_tgid(tgid))
+    return 0;
+
+  u32 pid = (u32)id;
+
+  bpf_printk("tracepoint: sys_exit_futex tgid=%u pid=%u\n", tgid, pid);
+  return 0;
+}
+
 // Userspace barrier wait call
 SEC("uprobe/libc.so.6:pthread_barrier_wait")
 int BPF_PROG(uprobe_pthread_barrier_wait, void *unused) {
@@ -520,7 +562,7 @@ int BPF_PROG(uprobe_pthread_barrier_wait, void *unused) {
     return 0;
   u32 pid = (u32)id;
 
-  bpf_printk("UPROBE: pthread_barrier_wait tgid=%u pid=%u\n", tgid, pid);
+  // bpf_printk("UPROBE: pthread_barrier_wait tgid=%u pid=%u\n", tgid, pid);
   return 0;
 }
 
@@ -534,7 +576,7 @@ int BPF_PROG(uretprobe_pthread_barrier_wait, void *unused) {
 
   u32 pid = (u32)id;
 
-  bpf_printk("URETPROBE: pthread_barrier_wait tgid=%u pid=%u\n", tgid, pid);
+  // bpf_printk("URETPROBE: pthread_barrier_wait tgid=%u pid=%u\n", tgid, pid);
   return 0;
 }
 
@@ -562,7 +604,7 @@ int BPF_PROG(uprobe_sem_wait, void *unused) {
 
   u32 pid = (u32)id;
 
-  bpf_printk("UPROBE: sem_wait tgid=%u pid=%u\n", tgid, pid);
+  // bpf_printk("UPROBE: sem_wait tgid=%u pid=%u\n", tgid, pid);
   return 0;
 }
 
@@ -576,7 +618,7 @@ int BPF_PROG(uretprobe_sem_wait, void *unused) {
 
   u32 pid = (u32)id;
 
-  bpf_printk("URETPROBE: sem_wait tgid=%u pid=%u\n", tgid, pid);
+  // bpf_printk("URETPROBE: sem_wait tgid=%u pid=%u\n", tgid, pid);
   return 0;
 }
 
@@ -619,8 +661,9 @@ int trace_block_rq_issue(struct trace_event_raw_block_rq *ctx) {
   u64 key = ((u64)ctx->dev << 32) | ctx->sector;
   bpf_map_update_elem(&disk_io_pid_map, &key, &id, BPF_ANY);
 
-  bpf_printk("TRACEPOINT: block_rq_issue tgid=%u pid=%u, dev=%u, sector=%ull\n",
-             tgid, pid, ctx->dev, ctx->sector);
+  // bpf_printk("TRACEPOINT: block_rq_issue tgid=%u pid=%u, dev=%u,
+  // sector=%ull\n",
+  //            tgid, pid, ctx->dev, ctx->sector);
   return enter_event(pid, SCHEDULED_IN, DISK_IO);
 }
 
@@ -645,8 +688,9 @@ int trace_block_rq_complete(struct trace_event_raw_block_rq_completion *ctx) {
 
   u32 pid = *pid_p;
 
-  bpf_printk("TRACEPOINT: block_rq_complete pid=%u, dev=%u, sector=%ull\n", pid,
-             ctx->dev, ctx->sector);
+  // bpf_printk("TRACEPOINT: block_rq_complete pid=%u, dev=%u, sector=%ull\n",
+  // pid,
+  //            ctx->dev, ctx->sector);
   size_t offset = offsetof(struct internal_thread_info, disk_io_time_ns);
   exit_event(pid, offset, DISK_IO, SCHEDULED_IN);
   bpf_map_delete_elem(&disk_io_pid_map, &key);

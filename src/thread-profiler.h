@@ -11,14 +11,15 @@ typedef enum thread_state {
   SCHEDULED_OUT = 0,
   SCHEDULED_IN = 1,
   MUTEX_WAIT = 2,
-  DISK_IO = 3,
-  THREAD_CREATE = 4,
-  THREAD_EXIT = 5,
+  FUTEX = 3,
+  DISK_IO = 4,
+  THREAD_CREATE = 5,
+  THREAD_EXIT = 6,
 } thread_state_t;
 
-const char *thread_state_name[] = {"SCHEDULED_OUT", "SCHEDULED_IN",
-                                   "MUTEX_WAIT",    "DISK_IO",
-                                   "THREAD_CREATE", "THREAD_EXIT"};
+const char *thread_state_name[] = {
+    "SCHEDULED_OUT", "SCHEDULED_IN",  "MUTEX_WAIT", "FUTEX",
+    "DISK_IO",       "THREAD_CREATE", "THREAD_EXIT"};
 
 struct internal_thread_info {
   unsigned long long thread_creation_ts;
@@ -28,6 +29,7 @@ struct internal_thread_info {
   unsigned long long last_event_ts;
   unsigned long long offcpu_time_ns;
   unsigned long long mutex_wait_time_ns;
+  unsigned long long futex_time_ns;
   unsigned long long disk_io_time_ns;
   thread_state_t state;
 };
@@ -40,6 +42,7 @@ struct profile_block {
   unsigned long long last_event_time_ns;
   unsigned long long offcpu_time_ns;
   unsigned long long mutex_wait_time_ns;
+  unsigned long long futex_time_ns;
   unsigned long long disk_io_time_ns;
   thread_state_t end_state;
 };
