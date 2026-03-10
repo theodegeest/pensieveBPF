@@ -424,7 +424,7 @@ static int exit_event(pid_t pid, size_t field_offset,
   info_p = bpf_map_lookup_elem(&thread_map, &pid);
   if (!info_p) {
     // This thread was not yet encountered
-    create_new_thread_info(&info, pid, MUTEX_WAIT, current_time);
+    create_new_thread_info(&info, pid, new_block_state, current_time);
     info_p = bpf_map_lookup_elem(&thread_map, &pid);
     if (!info_p) {
       bpf_printk("exit_event: Could not create thread info for (%d)\n", pid);
@@ -456,7 +456,7 @@ static int exit_event(pid_t pid, size_t field_offset,
     field_ptr = (u64 *)((char *)info_p + field_offset);
     *field_ptr += delta;
     info_p->last_event_ts = info_p->block_start_ts + granularity_ns;
-    info_p->state = MUTEX_WAIT;
+    info_p->state = new_state;
     submit_current_block(pid, info_p);
     bump_block(info_p, current_block_index, current_time);
   }
