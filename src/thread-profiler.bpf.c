@@ -139,6 +139,15 @@ static int handle_sched_switch(void *ctx, bool preempt,
       }
     }
 
+    if (info_p->state == MUTEX_WAIT) {
+      // This context switch happens during the futex wait call in a mutex wait.
+      // It can be scheduled out as the first futex wait call, but it can also
+      // intermittently be scheduled in and out during the futex wait. The lock
+      // is still not acquired. Do not count this as a scheduling out, it is
+      // still a mutex wait.
+      goto skip_prev;
+    }
+
     // bpf_printk("handle_sched_switch: prev thread info (%d)\n", pid);
 
     current_block_index =
@@ -156,6 +165,8 @@ static int handle_sched_switch(void *ctx, bool preempt,
     info_p->last_event_ts = current_time;
     info_p->state = SCHEDULED_OUT;
   }
+
+skip_prev:
 
   // Handle the task that is just scheduled in
 
@@ -177,6 +188,14 @@ static int handle_sched_switch(void *ctx, bool preempt,
           pid);
       return 0;
     }
+  }
+
+  if (info_p->state == MUTEX_WAIT) {
+    // This context switch happens during the futex wait call in a mutex wait.
+    // It is only temporarily scheduled in and will probably be scheduled out
+    // again inside the same lock. Do not count this as any scheduling out, the
+    // lock is still not acquired.
+    goto cleanup;
   }
 
   // bpf_printk(
