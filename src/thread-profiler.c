@@ -14,8 +14,7 @@
 
 static struct env {
   unsigned long long granularity_ns;
-  pid_t pids[MAX_PID_NR];
-  pid_t tids[MAX_TID_NR];
+  pid_t pid;
 } env = {.granularity_ns = 1e8};
 
 const char *argp_program_version = "thread_profiler 0.0";
@@ -26,24 +25,22 @@ const char argp_program_doc[] =
     "USAGE: thread-profiler [--help] [-p PID] [-t TID]"
     "EXAMPLES:\n"
     "    thread-profiler             # profile all threads until Ctrl-C\n"
-    "    thread-profiler -p 185,175,165 # only profile threads for PID "
-    "185,175,165\n"
-    "    thread-profiler -t 188,120,134 # only profile threads 188,120,134\n";
+    "    thread-profiler -p 185 # only profile threads for PID 185\n";
 
 static const struct argp_option opts[] = {
-    {"pid", 'p', "PID", 0, "Profile these PIDs only, comma-separated list", 0},
-    {"tid", 't', "TID", 0, "Profile these TIDs only, comma-separated list", 0},
+    {"pid", 'p', "PID", 0, "Profile this PID only", 0},
     {"granularity", 'g', "GRANULARITY-NS", 0,
      "Size of granularity for profile blocks in ns"},
     {},
 };
 
 static error_t parse_arg(int key, char *arg, struct argp_state *state) {
-  int ret;
+  // int ret;
+  long number;
   switch (key) {
   case 'g':
     errno = 0;
-    long number = strtol(arg, NULL, 10);
+    number = strtol(arg, NULL, 10);
     if (errno || number <= 0) {
       fprintf(stderr, "Invalid duration: %s\n", arg);
       argp_usage(state);
@@ -52,29 +49,13 @@ static error_t parse_arg(int key, char *arg, struct argp_state *state) {
     }
     break;
   case 'p':
-    ret = split_convert(strdup(arg), ",", env.pids, sizeof(env.pids),
-                        sizeof(pid_t), str_to_int);
-    if (ret) {
-      if (ret == -ENOBUFS)
-        fprintf(stderr, "the number of pid is too big, please "
-                        "increase MAX_PID_NR's value and recompile\n");
-      else
-        fprintf(stderr, "invalid PID: %s\n", arg);
-
+    errno = 0;
+    number = strtol(arg, NULL, 10);
+    if (errno || number <= 0) {
+      fprintf(stderr, "Invalid PID: %s\n", arg);
       argp_usage(state);
-    }
-    break;
-  case 't':
-    ret = split_convert(strdup(arg), ",", env.tids, sizeof(env.tids),
-                        sizeof(pid_t), str_to_int);
-    if (ret) {
-      if (ret == -ENOBUFS)
-        fprintf(stderr, "the number of tid is too big, please "
-                        "increase MAX_TID_NR's value and recompile\n");
-      else
-        fprintf(stderr, "invalid TID: %s\n", arg);
-
-      argp_usage(state);
+    } else {
+      env.pid = (unsigned long long)number;
     }
     break;
   case ARGP_KEY_ARG:
@@ -104,10 +85,11 @@ static volatile bool exiting = false;
 static void sig_handler(int sig) { exiting = true; }
 
 static void print_profile_block(struct profile_block *profile_block_p) {
-  printf("%d %llu %llu %llu %llu %llu %s\n", profile_block_p->tid,
+  printf("%d %llu %llu %llu %llu %llu %llu %s\n", profile_block_p->tid,
          profile_block_p->block_index, profile_block_p->block_start_time_ns,
          profile_block_p->first_event_time_ns,
          profile_block_p->last_event_time_ns, profile_block_p->offcpu_time_ns,
+         profile_block_p->mutex_wait_time_ns,
          thread_state_name[profile_block_p->end_state]);
 }
 
@@ -126,8 +108,7 @@ uint64_t get_current_time_ns() {
 int main(int argc, char **argv) {
   struct ring_buffer *rb = NULL;
   struct thread_profiler_bpf *skel;
-  int pids_fd, tids_fd, err, i;
-  __u8 val = 0;
+  int err;
 
   /* Parse command line arguments */
   err = argp_parse(&argp, argc, argv, 0, NULL, NULL);
@@ -153,37 +134,16 @@ int main(int argc, char **argv) {
 
   /* User space PID and TID correspond to TGID and PID in the kernel,
    * respectively */
-  if (env.pids[0])
+  if (env.pid) {
     skel->rodata->filter_by_tgid = true;
-  if (env.tids[0])
-    skel->rodata->filter_by_pid = true;
+    skel->rodata->filter_tgid = env.pid;
+  }
 
   /* Load & verify BPF programs */
   err = thread_profiler_bpf__load(skel);
   if (err) {
     fprintf(stderr, "Failed to load and verify BPF skeleton\n");
     goto cleanup;
-  }
-
-  if (env.pids[0]) {
-    /* User pids_fd points to the tgids map in the BPF program */
-    pids_fd = bpf_map__fd(skel->maps.tgids);
-    for (i = 0; i < MAX_PID_NR && env.pids[i]; i++) {
-      if (bpf_map_update_elem(pids_fd, &(env.pids[i]), &val, BPF_ANY) != 0) {
-        fprintf(stderr, "failed to init pids map: %s\n", strerror(errno));
-        goto cleanup;
-      }
-    }
-  }
-  if (env.tids[0]) {
-    /* User tids_fd points to the pids map in the BPF program */
-    tids_fd = bpf_map__fd(skel->maps.pids);
-    for (i = 0; i < MAX_TID_NR && env.tids[i]; i++) {
-      if (bpf_map_update_elem(tids_fd, &(env.tids[i]), &val, BPF_ANY) != 0) {
-        fprintf(stderr, "failed to init tids map: %s\n", strerror(errno));
-        goto cleanup;
-      }
-    }
   }
 
   /* Set up ring buffer polling */
@@ -272,9 +232,10 @@ int main(int argc, char **argv) {
       key = next_key;
 
       if (bpf_map_lookup_elem(map_fd, &key, &value) == 0) {
-        printf("%d %llu %llu %llu %llu %llu %s %lu\n", key, value.block_index,
+        printf("%d %llu %llu %llu %llu %llu %llu %s %lu\n", key, value.block_index,
                value.block_start_ts, value.first_block_event_ts,
                value.last_event_ts, value.offcpu_time_ns,
+               value.mutex_wait_time_ns,
                thread_state_name[value.state], get_current_time_ns());
       }
 

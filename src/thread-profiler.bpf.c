@@ -11,7 +11,7 @@ char LICENSE[] SEC("license") = "Dual BSD/GPL";
 
 const volatile unsigned long long granularity_ns = 1e8;
 const volatile bool filter_by_tgid = false;
-const volatile bool filter_by_pid = false;
+const volatile pid_t filter_tgid;
 
 struct {
   __uint(type, BPF_MAP_TYPE_HASH);
@@ -21,37 +21,20 @@ struct {
 } thread_map SEC(".maps");
 
 struct {
-  __uint(type, BPF_MAP_TYPE_HASH);
-  __type(key, u32);
-  __type(value, u8);
-  __uint(max_entries, MAX_PID_NR);
-} tgids SEC(".maps");
-
-struct {
-  __uint(type, BPF_MAP_TYPE_HASH);
-  __type(key, u32);
-  __type(value, u8);
-  __uint(max_entries, MAX_TID_NR);
-} pids SEC(".maps");
-
-struct {
   __uint(type, BPF_MAP_TYPE_RINGBUF);
   __uint(max_entries, 256 * 1024);
 } rb SEC(".maps");
 
-static bool allowed_pid_tgid(pid_t pid, pid_t tgid) {
-  if (filter_by_tgid && !bpf_map_lookup_elem(&tgids, &tgid))
-    return false;
-  if (filter_by_pid && !bpf_map_lookup_elem(&pids, &pid))
+static bool allowed_tgid(pid_t tgid) {
+  if (filter_by_tgid && tgid != filter_tgid)
     return false;
   return true;
 }
 
 static bool allowed_task(struct task_struct *task) {
-  u32 pid = BPF_CORE_READ(task, pid);
   u32 tgid = BPF_CORE_READ(task, tgid);
 
-  return allowed_pid_tgid(pid, tgid);
+  return allowed_tgid(tgid);
 }
 
 static u64 get_block_index(u64 current_time, u64 start_time) {
@@ -80,6 +63,7 @@ static int create_new_thread_info(struct internal_thread_info *info_p,
   info_p->first_block_event_ts = current_time;
   info_p->last_event_ts = current_time;
   info_p->offcpu_time_ns = 0;
+  info_p->mutex_wait_time_ns = 0;
   info_p->state = initial_state;
 
   return bpf_map_update_elem(&thread_map, &pid, info_p, BPF_ANY);
@@ -100,6 +84,7 @@ static int submit_current_block(pid_t pid,
   profile_block_p->first_event_time_ns = info_p->first_block_event_ts;
   profile_block_p->last_event_time_ns = info_p->last_event_ts;
   profile_block_p->offcpu_time_ns = info_p->offcpu_time_ns;
+  profile_block_p->mutex_wait_time_ns = info_p->mutex_wait_time_ns;
   profile_block_p->end_state = info_p->state;
 
   /* send data to user-space for post-processing */
@@ -115,6 +100,7 @@ static int bump_block(struct internal_thread_info *info_p,
   info_p->first_block_event_ts = current_time_ts;
   info_p->last_event_ts = current_time_ts;
   info_p->offcpu_time_ns = 0;
+  info_p->mutex_wait_time_ns = 0;
   return 0;
 }
 
@@ -258,12 +244,12 @@ int trace_fork(struct trace_event_raw_sched_process_fork *ctx) {
   pid_t pid, tgid;
   struct internal_thread_info *info_p, info = {};
 
-  pid = ctx->child_pid;
   tgid = ctx->parent_pid;
-
-  if (!allowed_pid_tgid(pid, tgid)) {
+  if (!allowed_tgid(tgid)) {
     return 0;
   }
+
+  pid = ctx->child_pid;
 
   // bpf_printk("fork parent=%d child=%d\n", ctx->parent_pid, ctx->child_pid);
 
@@ -301,7 +287,7 @@ int trace_exit(struct trace_event_raw_sched_process_template *ctx) {
   pid = (u32)pid_tgid;
   tgid = pid_tgid >> 32;
 
-  if (!allowed_pid_tgid(pid, tgid)) {
+  if (!allowed_tgid(tgid)) {
     return 0;
   }
 
@@ -349,13 +335,51 @@ cleanup:
 SEC("uprobe/libc.so.6:__pthread_mutex_lock")
 int BPF_PROG(uprobe_pthread_mutex_lock, void *unused) {
   u64 id = bpf_get_current_pid_tgid();
-  u32 pid = (u32)id;
   u32 tgid = id >> 32;
-
-  if (!allowed_pid_tgid(pid, tgid))
+  if (!allowed_tgid(tgid))
     return 0;
 
+  u32 pid = (u32)id;
+  struct internal_thread_info *info_p, info = {};
+
+  u64 current_time, current_block_index;
+
+  current_time = bpf_ktime_get_ns();
+
   // bpf_printk("UPROBE: pthread_mutex_lock tgid=%u pid=%u\n", tgid, pid);
+
+  info_p = bpf_map_lookup_elem(&thread_map, &pid);
+  if (!info_p) {
+    // There was no thread info, create new
+    bpf_printk("uprobe pthread_mutex_lock: no prev thread info (%d)\n", pid);
+    create_new_thread_info(&info, pid, SCHEDULED_IN, current_time);
+
+    info_p = bpf_map_lookup_elem(&thread_map, &pid);
+    if (!info_p) {
+      bpf_printk("uprobe pthread_mutex_lock: Could not create thread info for "
+                 "prev (%d)\n",
+                 pid);
+      return 0;
+    }
+  }
+
+  // bpf_printk("handle_sched_switch: prev thread info (%d)\n", pid);
+
+  current_block_index =
+      get_block_index(current_time, info_p->thread_creation_ts);
+  // bpf_printk("handle_sched_switch: current_block_index (%lld)\n",
+  //            current_block_index);
+
+  if (current_block_index > info_p->block_index) {
+    // The last event was in a previous block
+    // We need to submit this block to the user space
+    submit_current_block(pid, info_p);
+    bump_block(info_p, current_block_index, current_time);
+  }
+
+  info_p->last_event_ts = current_time;
+  info_p->state = MUTEX_WAIT;
+
   return 0;
 }
 
@@ -363,13 +387,84 @@ int BPF_PROG(uprobe_pthread_mutex_lock, void *unused) {
 SEC("uretprobe/libc.so.6:__pthread_mutex_lock")
 int BPF_PROG(uretprobe_pthread_mutex_lock, void *unused) {
   u64 id = bpf_get_current_pid_tgid();
-  u32 pid = (u32)id;
   u32 tgid = id >> 32;
-
-  if (!allowed_pid_tgid(pid, tgid))
+  if (!allowed_tgid(tgid))
     return 0;
 
+  u32 pid = (u32)id;
+  struct internal_thread_info *info_p, info = {};
+
+  s64 delta;
+
+  u64 current_time, current_block_index;
+
+  current_time = bpf_ktime_get_ns();
+
   // bpf_printk("URETPROBE: pthread_mutex_lock tgid=%u pid=%u\n", tgid, pid);
+  info_p = bpf_map_lookup_elem(&thread_map, &pid);
+  if (!info_p) {
+    // This thread was not yet encountered
+    create_new_thread_info(&info, pid, MUTEX_WAIT, current_time);
+    info_p = bpf_map_lookup_elem(&thread_map, &pid);
+    if (!info_p) {
+      bpf_printk(
+          "uretprobe pthread_mutex_lock: Could not create thread info for "
+          "next (%d)\n",
+          pid);
+      return 0;
+    }
+  }
+
+  // bpf_printk(
+  //     "handle_sched_switch [%d] pid (%d, %d) was scheduled out for %lld
+  //     ns\n", bpf_get_smp_processor_id(), pid, tgid, delta);
+
+  current_block_index =
+      get_block_index(current_time, info_p->thread_creation_ts);
+
+  if (current_block_index > info_p->block_index) {
+    // The last event was in a previous block
+    // We need to submit this block to the user space
+    delta =
+        (s64)(info_p->block_start_ts + granularity_ns - info_p->last_event_ts);
+    if (delta < 0) {
+      bpf_printk("uretprobe: delta previous block negative (%d)\n", pid);
+      goto cleanup;
+    }
+
+    if (delta > granularity_ns) {
+      bpf_printk("uretprobe pthread_mutex_lock: WARNING (%d) delta of previous "
+                 "block is higher than granularity_ns\n",
+                 pid);
+    }
+
+    info_p->mutex_wait_time_ns += delta;
+    info_p->last_event_ts = info_p->block_start_ts + granularity_ns;
+    info_p->state = MUTEX_WAIT;
+    submit_current_block(pid, info_p);
+    bump_block(info_p, current_block_index, current_time);
+  }
+
+  delta = (s64)(current_time - info_p->last_event_ts);
+  if (delta < 0) {
+    bpf_printk(
+        "uretprobe pthread_mutex_lock: delta current block negative (%d)\n",
+        pid);
+    goto cleanup;
+  }
+
+  if (delta > granularity_ns) {
+    bpf_printk(
+        "uretprobe pthread_mutex_lock: WARNING (%d) delta of current block is "
+        "higher than granularity_ns\n",
+        pid);
+  }
+
+  info_p->last_event_ts = current_time;
+  info_p->mutex_wait_time_ns += delta;
+  info_p->state = SCHEDULED_IN;
+
+cleanup:
   return 0;
 }
 
@@ -377,11 +472,10 @@ int BPF_PROG(uretprobe_pthread_mutex_lock, void *unused) {
 SEC("uprobe/libc.so.6:pthread_barrier_wait")
 int BPF_PROG(uprobe_pthread_barrier_wait, void *unused) {
   u64 id = bpf_get_current_pid_tgid();
-  u32 pid = (u32)id;   // thread id (tid)
-  u32 tgid = id >> 32; // process id (tgid)
-
-  if (!allowed_pid_tgid(pid, tgid))
+  u32 tgid = id >> 32;
+  if (!allowed_tgid(tgid))
     return 0;
+  u32 pid = (u32)id;
 
   bpf_printk("UPROBE: pthread_barrier_wait tgid=%u pid=%u\n", tgid, pid);
   return 0;
@@ -391,11 +485,11 @@ int BPF_PROG(uprobe_pthread_barrier_wait, void *unused) {
 SEC("uretprobe/libc.so.6:pthread_barrier_wait")
 int BPF_PROG(uretprobe_pthread_barrier_wait, void *unused) {
   u64 id = bpf_get_current_pid_tgid();
-  u32 pid = (u32)id;   // thread id (tid)
-  u32 tgid = id >> 32; // process id (tgid)
-
-  if (!allowed_pid_tgid(pid, tgid))
+  u32 tgid = id >> 32;
+  if (!allowed_tgid(tgid))
     return 0;
+
+  u32 pid = (u32)id;
 
   bpf_printk("URETPROBE: pthread_barrier_wait tgid=%u pid=%u\n", tgid, pid);
   return 0;
@@ -405,11 +499,11 @@ int BPF_PROG(uretprobe_pthread_barrier_wait, void *unused) {
 SEC("uprobe")
 int BPF_PROG(uprobe_pthread_cond_wait, void *unused) {
   u64 id = bpf_get_current_pid_tgid();
-  u32 pid = (u32)id;   // thread id (tid)
-  u32 tgid = id >> 32; // process id (tgid)
-
-  if (!allowed_pid_tgid(pid, tgid))
+  u32 tgid = id >> 32;
+  if (!allowed_tgid(tgid))
     return 0;
+
+  u32 pid = (u32)id;
 
   bpf_printk("UPROBE: pthread_cond_wait tgid=%u pid=%u\n", tgid, pid);
   return 0;
@@ -419,11 +513,11 @@ int BPF_PROG(uprobe_pthread_cond_wait, void *unused) {
 SEC("uprobe/libc.so.6:sem_wait")
 int BPF_PROG(uprobe_sem_wait, void *unused) {
   u64 id = bpf_get_current_pid_tgid();
-  u32 pid = (u32)id;   // thread id (tid)
-  u32 tgid = id >> 32; // process id (tgid)
-
-  if (!allowed_pid_tgid(pid, tgid))
+  u32 tgid = id >> 32;
+  if (!allowed_tgid(tgid))
     return 0;
+
+  u32 pid = (u32)id;
 
   bpf_printk("UPROBE: sem_wait tgid=%u pid=%u\n", tgid, pid);
   return 0;
@@ -433,11 +527,11 @@ int BPF_PROG(uprobe_sem_wait, void *unused) {
 SEC("uretprobe/libc.so.6:sem_wait")
 int BPF_PROG(uretprobe_sem_wait, void *unused) {
   u64 id = bpf_get_current_pid_tgid();
-  u32 pid = (u32)id;   // thread id (tid)
-  u32 tgid = id >> 32; // process id (tgid)
-
-  if (!allowed_pid_tgid(pid, tgid))
+  u32 tgid = id >> 32;
+  if (!allowed_tgid(tgid))
     return 0;
+
+  u32 pid = (u32)id;
 
   bpf_printk("URETPROBE: sem_wait tgid=%u pid=%u\n", tgid, pid);
   return 0;
