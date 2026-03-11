@@ -44,6 +44,9 @@ static bool allowed_task(struct task_struct *task) {
   return allowed_tgid(tgid);
 }
 
+// TODO: print array
+static void print_state_stack(struct internal_thread_info *info_p) {}
+
 static u64 get_block_index(u64 current_time, u64 start_time) {
   if (current_time < start_time) {
     bpf_printk("get_block_index [%d] current is before start time\n");
@@ -67,13 +70,14 @@ static int create_new_thread_info(struct internal_thread_info *info_p,
   info_p->thread_creation_ts = current_time;
   info_p->block_index = 0;
   info_p->block_start_ts = current_time;
-  info_p->first_block_event_ts = current_time;
+  // info_p->first_block_event_ts = current_time;
   info_p->last_event_ts = current_time;
   info_p->offcpu_time_ns = 0;
   info_p->mutex_wait_time_ns = 0;
   info_p->futex_time_ns = 0;
   info_p->disk_io_time_ns = 0;
-  info_p->state = initial_state;
+  // info_p->state = initial_state;
+  state_stack_push(info_p, initial_state);
 
   return bpf_map_update_elem(&thread_map, &pid, info_p, BPF_ANY);
 }
@@ -90,13 +94,14 @@ static int submit_current_block(pid_t pid,
   profile_block_p->tid = pid;
   profile_block_p->block_index = info_p->block_index;
   profile_block_p->block_start_time_ns = info_p->block_start_ts;
-  profile_block_p->first_event_time_ns = info_p->first_block_event_ts;
-  profile_block_p->last_event_time_ns = info_p->last_event_ts;
+  profile_block_p->block_end_time_ns = info_p->last_event_ts;
+  // profile_block_p->first_event_time_ns = info_p->first_block_event_ts;
+  // profile_block_p->last_event_time_ns = info_p->last_event_ts;
   profile_block_p->offcpu_time_ns = info_p->offcpu_time_ns;
-  profile_block_p->mutex_wait_time_ns = info_p->mutex_wait_time_ns;
+  profile_block_p->mutex_time_ns = info_p->mutex_time_ns;
   profile_block_p->futex_time_ns = info_p->futex_time_ns;
   profile_block_p->disk_io_time_ns = info_p->disk_io_time_ns;
-  profile_block_p->end_state = info_p->state;
+  // profile_block_p->end_state = info_p->state;
 
   /* send data to user-space for post-processing */
   bpf_ringbuf_submit(profile_block_p, 0);
@@ -108,14 +113,35 @@ static int bump_block(struct internal_thread_info *info_p,
   info_p->block_index = current_block_index;
   info_p->block_start_ts =
       start_of_block(current_time_ts, info_p->thread_creation_ts);
-  info_p->first_block_event_ts = current_time_ts;
+  // info_p->first_block_event_ts = current_time_ts;
   info_p->last_event_ts = current_time_ts;
   info_p->offcpu_time_ns = 0;
-  info_p->mutex_wait_time_ns = 0;
+  info_p->mutex_time_ns = 0;
   info_p->futex_time_ns = 0;
   info_p->disk_io_time_ns = 0;
   return 0;
 }
+
+// static int update_component(struct internal_thread_info *info_p,
+//                             u64 current_time) {
+//   thread_state_t state = state_stack_peek(info_p);
+//   s64 delta;
+//   switch (state) {
+//   case ERROR_STATE:
+//     bpf_printk("update_component: ERROR_STATE");
+//     break;
+//   case SCHEDULED_OUT:
+//     bpf_printk("update_component: SCHEDULED_OUT");
+//     break;
+//   case SCHEDULED_IN:
+//     bpf_printk("update_component: SCHEDULED_IN");
+//     delta =
+//         (s64)(info_p->block_start_ts + granularity_ns -
+//         info_p->last_event_ts);
+//     break;
+//   }
+//   return 0;
+// }
 
 static int handle_sched_switch(void *ctx, bool preempt,
                                struct task_struct *prev,
@@ -152,16 +178,11 @@ static int handle_sched_switch(void *ctx, bool preempt,
       }
     }
 
-    if (info_p->state == MUTEX_WAIT) {
-      // This context switch happens during the futex wait call in a mutex wait.
-      // It can be scheduled out as the first futex wait call, but it can also
-      // intermittently be scheduled in and out during the futex wait. The lock
-      // is still not acquired. Do not count this as a scheduling out, it is
-      // still a mutex wait.
-      goto skip_prev;
-    } else if (info_p->state == DISK_IO) {
-      goto skip_prev;
-    } else if (info_p->state == FUTEX) {
+    thread_state_t state = state_stack_peek(info_p);
+    if (state == MUTEX_WAIT || state == FUTEX || state == DISK_IO) {
+      // The top of the state stack is an event where we ignore schedule out
+      bpf_printk("handle_sched_switch: prev skip (%d) %s", pid,
+                 thread_state_name[state]);
       goto skip_prev;
     }
 
@@ -173,9 +194,36 @@ static int handle_sched_switch(void *ctx, bool preempt,
     //            current_block_index);
 
     if (current_block_index > info_p->block_index) {
-      // The last event was in a previous block
-      // We need to submit this block to the user space
+      // The last event was in a previous block. We need to update the
+      // components and submit this block to the user space
+
+      switch (state) {
+      case ERROR_STATE:
+        bpf_printk("handle_sched_switch: prev previous block ERROR_STATE");
+        break;
+      case SCHEDULED_OUT:
+        bpf_printk("handle_sched_switch: prev previous block SCHEDULED_OUT");
+        break;
+      case SCHEDULED_IN:
+        bpf_printk("handle_sched_switch: prev previous block SCHEDULED_IN");
+
+        // TODO: move this to the next part (schedule in of next task, not schedule out)
+        u64 block_end = info_p->block_start_ts + granularity_ns;
+        info_p->offcpu_time_ns += block_end - info_p->last_event_ts;
+        info_p->last_event_ts = block_end;
+        delta = (s64)(info_p->block_start_ts + granularity_ns -
+                      info_p->last_event_ts);
+        if (delta < 0) {
+          bpf_printk(
+              "handle_sched_switch: next delta previous block negative (%d)\n",
+              pid);
+          goto cleanup;
+        }
+        break;
+      }
+
       submit_current_block(pid, info_p);
+      // FIX: no bump
       bump_block(info_p, current_block_index, current_time);
     }
 
