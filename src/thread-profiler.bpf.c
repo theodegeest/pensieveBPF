@@ -656,6 +656,7 @@ static int enter_event(pid_t pid, thread_state_t new_block_state,
   info_p->last_event_ts = current_time;
   switch (new_state) {
   case MUTEX:
+  case DISK_IO:
     switch (state) {
     case SCHEDULED_OUT:
     case MUTEX:
@@ -757,6 +758,7 @@ static int exit_event(pid_t pid, thread_state_t calling_state) {
 
   switch (calling_state) {
   case MUTEX:
+  case DISK_IO:
     switch (state) {
     case SCHEDULED_OUT: // This one would be weird
     case MUTEX:
@@ -935,24 +937,24 @@ int trace_exit_futex(struct trace_event_raw_sys_exit *ctx) {
 //   return 0;
 // }
 
-// SEC("tracepoint/block/block_rq_issue")
-// int trace_block_rq_issue(struct trace_event_raw_block_rq *ctx) {
-//   u64 id = bpf_get_current_pid_tgid();
-//   u32 tgid = id >> 32;
-//   if (!allowed_tgid(tgid))
-//     return 0;
+SEC("tracepoint/block/block_rq_issue")
+int trace_block_rq_issue(struct trace_event_raw_block_rq *ctx) {
+  u64 id = bpf_get_current_pid_tgid();
+  u32 tgid = id >> 32;
+  if (!allowed_tgid(tgid))
+    return 0;
 
-//   u32 pid = (u32)id;
+  u32 pid = (u32)id;
 
-//   // The key is a composition, it is not that strong but it should be fine
-//   u64 key = ((u64)ctx->dev << 32) | ctx->sector;
-//   bpf_map_update_elem(&disk_io_pid_map, &key, &id, BPF_ANY);
+  // The key is a composition, it is not that strong but it should be fine
+  u64 key = ((u64)ctx->dev << 32) | ctx->sector;
+  bpf_map_update_elem(&disk_io_pid_map, &key, &id, BPF_ANY);
 
-//   // bpf_printk("TRACEPOINT: block_rq_issue tgid=%u pid=%u, dev=%u,
-//   // sector=%ull\n",
-//   //            tgid, pid, ctx->dev, ctx->sector);
-//   return enter_event(pid, SCHEDULED_IN, DISK_IO);
-// }
+  // bpf_printk("TRACEPOINT: block_rq_issue tgid=%u pid=%u, dev=%u,
+  // sector=%ull\n",
+  //            tgid, pid, ctx->dev, ctx->sector);
+  return enter_event(pid, SCHEDULED_IN, DISK_IO);
+}
 
 // For the IO completion we need to do a workaround. The problem is that the
 // process that completes the IO instructions is not necessarily the same as
@@ -963,25 +965,23 @@ int trace_exit_futex(struct trace_event_raw_sys_exit *ctx) {
 // think one approach is to actually look if the scheduler is scheduling out the
 // thread while IO is happening. That would be a strong indication that it
 // is synchronous IO and not asynchronous. To be thought about in the future.
-// SEC("tracepoint/block/block_rq_complete")
-// int trace_block_rq_complete(struct trace_event_raw_block_rq_completion *ctx)
-// {
+SEC("tracepoint/block/block_rq_complete")
+int trace_block_rq_complete(struct trace_event_raw_block_rq_completion *ctx) {
 
-//   u64 key = ((u64)ctx->dev << 32) | ctx->sector;
-//   u32 *pid_p = bpf_map_lookup_elem(&disk_io_pid_map, &key);
+  u64 key = ((u64)ctx->dev << 32) | ctx->sector;
+  u32 *pid_p = bpf_map_lookup_elem(&disk_io_pid_map, &key);
 
-//   // The pid was not in the map, so it was not allowed
-//   if (!pid_p)
-//     return 0;
+  // The pid was not in the map, so it was not allowed
+  if (!pid_p)
+    return 0;
 
-//   u32 pid = *pid_p;
+  u32 pid = *pid_p;
 
-//   // bpf_printk("TRACEPOINT: block_rq_complete pid=%u, dev=%u,
-//   sector=%ull\n",
-//   // pid,
-//   //            ctx->dev, ctx->sector);
-//   size_t offset = offsetof(struct internal_thread_info, disk_io_time_ns);
-//   exit_event(pid, offset, DISK_IO, SCHEDULED_IN);
-//   bpf_map_delete_elem(&disk_io_pid_map, &key);
-//   return 0;
-// }
+  // bpf_printk("TRACEPOINT: block_rq_complete pid=%u, dev=%u, sector=%ull\n",
+  // pid,
+  //            ctx->dev, ctx->sector);
+  // size_t offset = offsetof(struct internal_thread_info, disk_io_time_ns);
+  exit_event(pid, DISK_IO);
+  bpf_map_delete_elem(&disk_io_pid_map, &key);
+  return 0;
+}
