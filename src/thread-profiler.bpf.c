@@ -61,7 +61,7 @@ static u64 get_block_index(u64 current_time, u64 start_time) {
   return (current_time - start_time) / granularity_ns;
 }
 
-static s64 start_of_block(u64 current_time, u64 start_time) {
+static s64 get_start_of_block(u64 current_time, u64 start_time) {
   if (current_time < start_time) {
     bpf_printk("start_of_block [%d] current is before start time\n");
     return -1;
@@ -70,7 +70,7 @@ static s64 start_of_block(u64 current_time, u64 start_time) {
   return start_time + n * granularity_ns;
 }
 
-static u64 start_of_nth_block(u64 start_time, u64 n) {
+static u64 get_start_of_nth_block(u64 start_time, u64 n) {
   return start_time + n * granularity_ns;
 }
 
@@ -90,6 +90,32 @@ static int create_new_thread_info(struct internal_thread_info *info_p,
   state_stack_push(info_p, initial_state);
 
   return bpf_map_update_elem(&thread_map, &pid, info_p, BPF_ANY);
+}
+
+static int block_bump_to_n(struct internal_thread_info *info_p,
+                           u64 block_index) {
+  info_p->block_index = block_index;
+  info_p->block_start_ts =
+      get_start_of_nth_block(info_p->thread_creation_ts, block_index);
+  // info_p->first_block_event_ts = current_time_ts;
+  info_p->last_event_ts = info_p->block_start_ts;
+  info_p->offcpu_time_ns = 0;
+  info_p->mutex_time_ns = 0;
+  info_p->futex_time_ns = 0;
+  info_p->disk_io_time_ns = 0;
+  return 0;
+}
+
+static int block_bump_one(struct internal_thread_info *info_p) {
+  info_p->block_index++;
+  info_p->block_start_ts =
+      get_start_of_nth_block(info_p->thread_creation_ts, info_p->block_index);
+  info_p->last_event_ts = info_p->block_start_ts;
+  info_p->offcpu_time_ns = 0;
+  info_p->mutex_time_ns = 0;
+  info_p->futex_time_ns = 0;
+  info_p->disk_io_time_ns = 0;
+  return 0;
 }
 
 static int submit_current_block(pid_t pid,
@@ -118,52 +144,49 @@ static int submit_current_block(pid_t pid,
   return 0;
 }
 
-static int bump_block(struct internal_thread_info *info_p,
-                      u64 current_block_index) {
-  info_p->block_index = current_block_index;
-  info_p->block_start_ts =
-      start_of_nth_block(info_p->thread_creation_ts, current_block_index);
-  // info_p->first_block_event_ts = current_time_ts;
-  info_p->last_event_ts = info_p->block_start_ts;
-  info_p->offcpu_time_ns = 0;
-  info_p->mutex_time_ns = 0;
-  info_p->futex_time_ns = 0;
-  info_p->disk_io_time_ns = 0;
-  return 0;
+static void add_to_component(struct internal_thread_info *info_p,
+                             thread_state_t state, s64 value) {
+  switch (state) {
+  case SCHEDULED_OUT:
+    info_p->offcpu_time_ns += value;
+    break;
+  case MUTEX:
+    info_p->mutex_time_ns += value;
+    break;
+  case FUTEX:
+    info_p->futex_time_ns += value;
+    break;
+  case DISK_IO:
+    info_p->disk_io_time_ns += value;
+    break;
+  default:
+    break;
+  }
 }
 
-static int make_next_block(struct internal_thread_info *info_p) {
-  info_p->block_index++;
-  info_p->block_start_ts =
-      start_of_nth_block(info_p->thread_creation_ts, info_p->block_index);
-  info_p->last_event_ts = info_p->block_start_ts;
-  info_p->offcpu_time_ns = 0;
-  info_p->mutex_time_ns = 0;
-  info_p->futex_time_ns = 0;
-  info_p->disk_io_time_ns = 0;
-  return 0;
-}
+static void submit_previous_blocks(struct internal_thread_info *info_p,
+                                   pid_t pid, thread_state_t state,
+                                   u64 current_block_index) {
+  s64 delta;
+  u64 block_end = info_p->block_start_ts + granularity_ns;
+  delta = block_end - info_p->last_event_ts;
+  add_to_component(info_p, state, delta);
+  info_p->last_event_ts = block_end;
+  submit_current_block(pid, info_p);
+  block_bump_one(info_p);
+  if (current_block_index > info_p->block_index) {
+    // There was at least one granularity_ns in between, submit a block of
+    // that size
 
-// static int update_component(struct internal_thread_info *info_p,
-//                             u64 current_time) {
-//   thread_state_t state = state_stack_peek(info_p);
-//   s64 delta;
-//   switch (state) {
-//   case ERROR_STATE:
-//     bpf_printk("update_component: ERROR_STATE");
-//     break;
-//   case SCHEDULED_OUT:
-//     bpf_printk("update_component: SCHEDULED_OUT");
-//     break;
-//   case SCHEDULED_IN:
-//     bpf_printk("update_component: SCHEDULED_IN");
-//     delta =
-//         (s64)(info_p->block_start_ts + granularity_ns -
-//         info_p->last_event_ts);
-//     break;
-//   }
-//   return 0;
-// }
+    block_end =
+        get_start_of_nth_block(info_p->thread_creation_ts, current_block_index);
+    delta = block_end - info_p->block_start_ts;
+    add_to_component(info_p, state, delta);
+    info_p->last_event_ts = block_end;
+    submit_current_block(pid, info_p);
+    block_bump_to_n(info_p, current_block_index);
+  }
+}
 
 static int handle_sched_switch(void *ctx, bool preempt,
                                struct task_struct *prev,
@@ -230,14 +253,14 @@ static int handle_sched_switch(void *ctx, bool preempt,
 
       info_p->last_event_ts = info_p->block_start_ts + granularity_ns;
       submit_current_block(pid, info_p);
-      make_next_block(info_p);
+      block_bump_one(info_p);
       if (current_block_index > info_p->block_index) {
         // There was at least one granularity_ns in between, submit a block of
         // that size NOTE: We do not add any components (all 0)
-        info_p->last_event_ts =
-            start_of_nth_block(info_p->thread_creation_ts, current_block_index);
+        info_p->last_event_ts = get_start_of_nth_block(
+            info_p->thread_creation_ts, current_block_index);
         submit_current_block(pid, info_p);
-        bump_block(info_p, current_block_index);
+        block_bump_to_n(info_p, current_block_index);
       }
     }
 
@@ -345,17 +368,17 @@ skip_prev:
     info_p->offcpu_time_ns += block_end - info_p->last_event_ts;
     info_p->last_event_ts = block_end;
     submit_current_block(pid, info_p);
-    make_next_block(info_p);
+    block_bump_one(info_p);
     if (current_block_index > info_p->block_index) {
       // There was at least one granularity_ns in between, submit a block of
       // that size NOTE: We do not add any components (all 0)
 
-      block_end =
-          start_of_nth_block(info_p->thread_creation_ts, current_block_index);
+      block_end = get_start_of_nth_block(info_p->thread_creation_ts,
+                                         current_block_index);
       info_p->offcpu_time_ns += block_end - info_p->block_start_ts;
       info_p->last_event_ts = block_end;
       submit_current_block(pid, info_p);
-      bump_block(info_p, current_block_index);
+      block_bump_to_n(info_p, current_block_index);
     }
 
     // delta =
@@ -402,60 +425,6 @@ skip_prev:
 
 cleanup:
   return 0;
-}
-
-static void submit_previous_blocks(struct internal_thread_info *info_p,
-                                   pid_t pid, thread_state_t state,
-                                   u64 current_block_index) {
-  s64 delta;
-  u64 block_end = info_p->block_start_ts + granularity_ns;
-  delta = block_end - info_p->last_event_ts;
-  switch (state) {
-  case SCHEDULED_OUT:
-    info_p->offcpu_time_ns += delta;
-    break;
-  case MUTEX:
-    info_p->mutex_time_ns += delta;
-    break;
-  case FUTEX:
-    info_p->futex_time_ns += delta;
-    break;
-  case DISK_IO:
-    info_p->disk_io_time_ns += delta;
-    break;
-  default:
-    break;
-  }
-  info_p->last_event_ts = block_end;
-  submit_current_block(pid, info_p);
-  make_next_block(info_p);
-  if (current_block_index > info_p->block_index) {
-    // There was at least one granularity_ns in between, submit a block of
-    // that size
-
-    block_end =
-        start_of_nth_block(info_p->thread_creation_ts, current_block_index);
-    delta = block_end - info_p->block_start_ts;
-    switch (state) {
-    case SCHEDULED_OUT:
-      info_p->offcpu_time_ns += delta;
-      break;
-    case MUTEX:
-      info_p->mutex_time_ns += delta;
-      break;
-    case FUTEX:
-      info_p->futex_time_ns += delta;
-      break;
-    case DISK_IO:
-      info_p->disk_io_time_ns += delta;
-      break;
-    default:
-      break;
-    }
-    info_p->last_event_ts = block_end;
-    submit_current_block(pid, info_p);
-    bump_block(info_p, current_block_index);
-  }
 }
 
 SEC("tp_btf/sched_switch")
@@ -553,22 +522,7 @@ int trace_exit(struct trace_event_raw_sched_process_template *ctx) {
   //            start_of_block(current_time_ts, info_p->thread_creation_ts));
 
   delta = current_time_ts - info_p->last_event_ts;
-  switch (state) {
-  case SCHEDULED_OUT:
-    info_p->offcpu_time_ns += delta;
-    break;
-  case MUTEX:
-    info_p->mutex_time_ns += delta;
-    break;
-  case FUTEX:
-    info_p->futex_time_ns += delta;
-    break;
-  case DISK_IO:
-    info_p->disk_io_time_ns += delta;
-    break;
-  default:
-    break;
-  }
+  add_to_component(info_p, state, delta);
   info_p->last_event_ts = current_time_ts;
   submit_current_block(pid, info_p);
 
@@ -598,8 +552,7 @@ cleanup:
 // because we can use enums that are numbers to reference in an array so that
 // might also be a way to get the offset in the struct
 
-static int enter_event(pid_t pid, thread_state_t new_block_state,
-                       thread_state_t new_state) {
+static int enter_event(pid_t pid, thread_state_t new_state) {
   struct internal_thread_info *info_p, info = {};
 
   u64 current_time, current_block_index;
@@ -636,22 +589,7 @@ static int enter_event(pid_t pid, thread_state_t new_block_state,
   }
 
   delta = current_time - info_p->last_event_ts;
-  switch (state) {
-  case SCHEDULED_OUT:
-    info_p->offcpu_time_ns += delta;
-    break;
-  case MUTEX:
-    info_p->mutex_time_ns += delta;
-    break;
-  case FUTEX:
-    info_p->futex_time_ns += delta;
-    break;
-  case DISK_IO:
-    info_p->disk_io_time_ns += delta;
-    break;
-  default:
-    break;
-  }
+  add_to_component(info_p, state, delta);
 
   info_p->last_event_ts = current_time;
   switch (new_state) {
@@ -720,22 +658,7 @@ static int exit_event(pid_t pid, thread_state_t calling_state) {
   }
 
   delta = current_time - info_p->last_event_ts;
-  switch (state) {
-  case SCHEDULED_OUT:
-    info_p->offcpu_time_ns += delta;
-    break;
-  case MUTEX:
-    info_p->mutex_time_ns += delta;
-    break;
-  case FUTEX:
-    info_p->futex_time_ns += delta;
-    break;
-  case DISK_IO:
-    info_p->disk_io_time_ns += delta;
-    break;
-  default:
-    break;
-  }
+  add_to_component(info_p, state, delta);
 
   // delta = (s64)(current_time - info_p->last_event_ts);
   // if (delta < 0) {
@@ -799,7 +722,7 @@ int BPF_PROG(uprobe_pthread_mutex_lock, void *unused) {
 
   u32 pid = (u32)id;
 
-  return enter_event(pid, SCHEDULED_IN, MUTEX);
+  return enter_event(pid, MUTEX);
 }
 
 // Userspace mutex lock return
@@ -826,7 +749,7 @@ int trace_enter_futex(struct trace_event_raw_sys_enter *ctx) {
   u32 pid = (u32)id;
 
   // bpf_printk("tracepoint: sys_enter_futex tgid=%u pid=%u\n", tgid, pid);
-  return enter_event(pid, SCHEDULED_IN, FUTEX);
+  return enter_event(pid, FUTEX);
 }
 
 SEC("tracepoint/syscalls/sys_exit_futex")
@@ -953,7 +876,7 @@ int trace_block_rq_issue(struct trace_event_raw_block_rq *ctx) {
   // bpf_printk("TRACEPOINT: block_rq_issue tgid=%u pid=%u, dev=%u,
   // sector=%ull\n",
   //            tgid, pid, ctx->dev, ctx->sector);
-  return enter_event(pid, SCHEDULED_IN, DISK_IO);
+  return enter_event(pid, DISK_IO);
 }
 
 // For the IO completion we need to do a workaround. The problem is that the
