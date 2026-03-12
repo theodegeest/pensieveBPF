@@ -284,6 +284,7 @@ skip_prev:
   info_p = bpf_map_lookup_elem(&thread_map, &pid);
   if (!info_p) {
     // This thread was not yet encountered
+    bpf_printk("handle_sched_switch: no next thread info (%d)\n", pid);
     create_new_thread_info(&info, pid, THREAD_CREATE, current_time);
     info_p = bpf_map_lookup_elem(&thread_map, &pid);
     if (!info_p) {
