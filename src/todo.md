@@ -18,6 +18,7 @@
 - sleep?
   tracepoint/syscalls/sys_enter_nanosleep
 
+- add allocation metric
 - add synchronisation metric (contention?)
 - add syscall metric
 - add memory metric (LLC?)

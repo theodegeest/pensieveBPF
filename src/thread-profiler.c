@@ -35,7 +35,6 @@ static const struct argp_option opts[] = {
 };
 
 static error_t parse_arg(int key, char *arg, struct argp_state *state) {
-  // int ret;
   long number;
   switch (key) {
   case 'g':
