@@ -7,6 +7,8 @@
 #define MAX_PID_NR 30
 #define MAX_TID_NR 30
 
+// TODO: Rename state -> mark
+// These are the states that the state machines keep track of
 typedef enum thread_state {
   ERROR_STATE = 0,
   SCHEDULED_OUT = 1,
@@ -18,6 +20,7 @@ typedef enum thread_state {
   THREAD_EXIT = 7,
 } thread_state_t;
 
+// This is an array that makes it possible to print the states to stdout.
 static const char *const thread_state_name[] = {
     "ERROR_STATE", "SCHEDULED_OUT", "SCHEDULED_IN",  "MUTEX",
     "FUTEX",       "DISK_IO",       "THREAD_CREATE", "THREAD_EXIT"};
@@ -25,13 +28,22 @@ static const char *const thread_state_name[] = {
 #define THREAD_STATE_NAME_COUNT                                                \
   (sizeof(thread_state_name) / sizeof(thread_state_name[0]))
 
+struct profile_block {
+  int tid;
+  unsigned long long block_index;
+  unsigned long long block_start_time_ns;
+  unsigned long long block_end_time_ns;
+  unsigned long long offcpu_time_ns;
+  unsigned long long mutex_time_ns;
+  unsigned long long futex_time_ns;
+  unsigned long long disk_io_time_ns;
+};
+
 #define STATE_STACK_MAX_DEPTH 5
 struct internal_thread_info {
   unsigned long long thread_creation_ts;
   unsigned long long block_index;
   unsigned long long block_start_ts;
-  // unsigned long long block_end_ts;
-  // unsigned long long first_block_event_ts;
   unsigned long long last_event_ts;
   unsigned long long offcpu_time_ns;
   unsigned long long mutex_time_ns;
@@ -193,46 +205,5 @@ static inline int state_stack_push(struct internal_thread_info *info_p,
   info_p->state_depth++;
   return 1;
 }
-
-// static thread_state_t state_stack_peek(struct internal_thread_info *info_p) {
-//   unsigned int depth = info_p->state_depth;
-//   if (depth >= 0 && depth < STATE_STACK_MAX_DEPTH) {
-//     return info_p->state_stack[depth];
-//   } else {
-//     return ERROR_STATE;
-//   }
-// }
-
-// static thread_state_t state_stack_pop(struct internal_thread_info *info_p) {
-//   if (info_p->state_depth > 0) {
-//     return info_p->state_stack[info_p->state_depth--];
-//   } else {
-//     return ERROR_STATE;
-//   }
-// }
-
-// static int state_stack_push(struct internal_thread_info *info_p,
-//                             thread_state_t state) {
-//   if (info_p->state_depth < STATE_STACK_MAX_DEPTH - 1) {
-//     info_p->state_stack[++(info_p->state_depth)] = state;
-//     return 1;
-//   } else {
-//     return 0;
-//   }
-// }
-
-struct profile_block {
-  int tid;
-  unsigned long long block_index;
-  unsigned long long block_start_time_ns;
-  unsigned long long block_end_time_ns;
-  // unsigned long long first_event_time_ns;
-  // unsigned long long last_event_time_ns;
-  unsigned long long offcpu_time_ns;
-  unsigned long long mutex_time_ns;
-  unsigned long long futex_time_ns;
-  unsigned long long disk_io_time_ns;
-  // thread_state_t end_state;
-};
 
 #endif /* __THREAD_PROFILER_H */
