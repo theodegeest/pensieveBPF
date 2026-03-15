@@ -470,6 +470,7 @@ static int exit_event(pid_t pid, thread_state_t calling_state) {
   delta = current_time - info_p->last_event_ts;
   add_to_component(info_p, state, delta);
 
+  info_p->last_event_ts = current_time;
   switch (calling_state) {
   case MUTEX:
   case DISK_IO:
