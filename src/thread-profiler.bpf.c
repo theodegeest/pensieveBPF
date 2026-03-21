@@ -618,30 +618,30 @@ cleanup:
 }
 
 // This is the probe for a call to pthread_mutex_wait()
-SEC("uprobe/libc.so.6:__pthread_mutex_lock")
-int BPF_PROG(uprobe_pthread_mutex_lock, void *unused) {
-  u64 id = bpf_get_current_pid_tgid();
-  u32 tgid = id >> 32;
-  if (!allowed_tgid(tgid))
-    return 0;
+// SEC("uprobe/libc.so.6:__pthread_mutex_lock")
+// int BPF_PROG(uprobe_pthread_mutex_lock, void *unused) {
+//   u64 id = bpf_get_current_pid_tgid();
+//   u32 tgid = id >> 32;
+//   if (!allowed_tgid(tgid))
+//     return 0;
 
-  u32 pid = (u32)id;
+//   u32 pid = (u32)id;
 
-  return enter_event(pid, MUTEX);
-}
+//   return enter_event(pid, MUTEX);
+// }
 
 // This is the probe for the return of a call to pthread_mutex_wait()
-SEC("uretprobe/libc.so.6:__pthread_mutex_lock")
-int BPF_PROG(uretprobe_pthread_mutex_lock, void *unused) {
-  u64 id = bpf_get_current_pid_tgid();
-  u32 tgid = id >> 32;
-  if (!allowed_tgid(tgid))
-    return 0;
+// SEC("uretprobe/libc.so.6:__pthread_mutex_lock")
+// int BPF_PROG(uretprobe_pthread_mutex_lock, void *unused) {
+//   u64 id = bpf_get_current_pid_tgid();
+//   u32 tgid = id >> 32;
+//   if (!allowed_tgid(tgid))
+//     return 0;
 
-  u32 pid = (u32)id;
+//   u32 pid = (u32)id;
 
-  return exit_event(pid, MUTEX);
-}
+//   return exit_event(pid, MUTEX);
+// }
 
 // This is the probe for the futex enter event.
 SEC("tracepoint/syscalls/sys_enter_futex")
